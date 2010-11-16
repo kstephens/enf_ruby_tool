@@ -1,11 +1,18 @@
 
-= enf_ruby_too =
+= enf_ruby_too
 
-Enf Ruby Code analysis and transformation tools.
+Enf Ruby code analysis and transformation tools.
 
-== Author ==
+= bin
+
+* module_name_checker -
+** recursively scan directories for *.rb files
+** parse files
+** syntactically analyze for module or class definitions
+** suggest filenames for each module
+** suggest mixins for reopened core modules   
+
+== Author
 
 * Kurt Stephens <ks.ruby@kurtstephens.com>
-
-
 
