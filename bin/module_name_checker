@@ -8,6 +8,8 @@
 module Enf
 
 class ModuleNameChecker
+  class Error < ::Exception; end
+
   EMPTY_String = ''.freeze
   EMPTY_Hash = { }.freeze
   EMPTY_Array = [ ].freeze
@@ -22,147 +24,330 @@ class ModuleNameChecker
   @@core_modules = @@core_modules_by_name.values.sort_by{|x| x.name}
 
   @@lib_paths = $:
-  @@std_paths = eval(`RUBY_LIB= ruby -e 'puts $:.inspect'`)
+  @@std_paths = eval(`RUBYLIB= ruby -e 'puts $:.inspect'`)
 
-  attr_accessor :lib_paths, :std_paths, :paths
+  attr_accessor :lib_paths, :std_paths, :skip_paths, :other_paths, :paths
   attr_accessor :core_modules
   attr_reader :all_files, :all_required
 
   def initialize opts = nil
+    @args = ARGV
     @all_files = [ ]
     @all_required = { }
+    @other_paths = [ ]
     @exceptions = [ ]
+    @skip_paths = [ ]
+    @debug ||= 0
+    @pause ||= 0
     (opts || EMPTY_Hash).each do | k, v |
       send(:"#{k}=", v)
     end
+    @args = @args.map{|x| x.dup}
   end
 
   def lib_paths
-    @lib_paths || @@lib_paths
+    @lib_paths ||= @@lib_paths.dup
   end
 
   def std_paths
-    @std_paths || @@std_paths
+    @std_paths ||= @@std_paths.dup
   end
 
   def core_modules
-    @core_modules || @@core_modules
+    @core_modules ||= @@core_modules.dup
   end
 
   def core_modules_by_name
-    @core_modules_by_name || @@core_modules_by_name
+    @core_modules_by_name ||= @@core_modules_by_name.dup
+  end
+
+  def parse_args!
+    args = @args.dup
+    until args.empty?
+      arg = args.shift
+      # $stderr.puts "  arg = #{arg.inspect}"
+      case arg
+      when /^--?d/
+        @debug += 1
+      when /^--?p/
+        @pause += 1
+      when /^--?(sp|skip-path)/
+        arg = args.shift
+        @skip_paths.push(*arg.split(/\s+|\s*,\s*/))
+      when /^--?(paths)/
+        until args.empty?
+          arg = args.shift
+          # $stderr.puts "    paths arg = #{arg.inspect}"
+          case arg
+          when /^-/
+            args.unshift arg
+            break
+          else
+            other_paths.push(*arg.split(/\s+|\s*,\s*/))
+          end
+        end
+      when /^--?/
+        raise Error, "unknown option #{arg}"
+      else
+        other_paths << arg
+      end
+    end
+
+    if @debug + @pause > 0
+      gem 'ruby-debug'
+      require 'ruby-debug'
+    end
+
+    self
   end
 
   def locate_files!
-    @paths = lib_paths - (std_paths - [ '.' ])
+    @paths = lib_paths - 
+      (std_paths - [ '.' ]) + 
+      other_paths
+
+    skip_paths = 
+      @skip_paths.map{|p| FilePattern.new p} +
+      @skip_paths.map{|p| FilePattern.new(File.expand_path(p))}
+    @paths.delete_if{|p| skip_paths.any?{|sp| sp === p}}
+
     puts "lib_paths = #{lib_paths.inspect}"
     puts "std_paths = #{std_paths.inspect}"
+    puts "other_paths = #{other_paths.inspect}"
+    puts "skip_paths = #{skip_paths.inspect}"
     puts "paths = #{@paths.inspect}"
-    puts "core_modules = #{@@core_modules.inspect}"
+    puts "core_modules = #{core_modules.inspect}"
+
+    # exit 0
 
     @paths.each do | dir |
+      dir_rx = %r{\A#{dir}/}
       files = Dir["#{dir}/**/*.rb"].sort
-      puts "dir = #{dir.inspect}"
+      # puts "dir = #{dir.inspect}"
       # puts "files = #{PP.pp(files, '')}"
       files.each do | file |
+        rel_path = file
         # puts "  file = #{file.inspect}"    
-        file.sub!(%r{\A#{dir}/}, '')
+        file.sub!(dir_rx, '')
         # puts "  file = #{file.inspect}"
         next if all_required[file]
-        f_d = { :file => file, :dir => dir, :full_path => File.expand_path(file, dir) }
+        f_d = { 
+          :file => file, 
+          :dir => dir, 
+          :rel_path => rel_path,
+          :abs_path => File.expand_path(file, dir),
+        }
         all_required[file] = f_d
         all_files << f_d
       end
     end
+    all_files.sort! { | a, b | a[:abs_path] <=> b[:abs_path] }
     self
   end
   
   def check_files!
+    pass_0!
+    pass_1!
+    pass_2!
+    output!
+    self
+  end
+
+  def pass_0!
+    do_all_files! :pass_0! do | f |
+      f[:namespaces] = [ ]
+
+      parser = RubyParser.new
+      parser.file = f[:file]
+      
+      sexp = parser.parse(File.read(f[:abs_path]))
+      
+      nss = AstScanner.new
+      nss.core_modules = @@core_modules
+      
+      nss.s_unit! sexp
+      
+      namespaces = f[:namespaces] = nss.namespaces
+      
+      namespaces.each do | ns |
+        parents = [ ]
+        x = ns[:parent]
+        while x
+          parents << x
+          x = x[:parent]
+        end
+        ns[:parents] = parents
+      end
+    end
+  end
+
+  def pass_1!
+    do_all_files! :pass_1! do | f |
+      # pp nss
+      first_namespace = prev_namespace = nil
+      f[:namespaces].each do | ns |
+        if core_modules_by_name[ns[:name]]
+          mp = ns[:name_path].dup
+          last = mp.pop
+          last = :"Mixin#{last}"
+          mp.push last
+          if mp.size == 1 
+            if other_ns = prev_namespace || first_namespace
+              mp.unshift other_ns[:name_path]
+              mp.flatten!
+            else
+              mp.unshift :SOMETHING
+            end
+          end
+          ns[:suggest_type] = :module
+          ns[:suggest_name] = mp * "::"
+          ns[:suggest_mixin] = ns[:suggest_name]
+          suggest ns, "Create a mixin named #{ns[:suggest_name]} for patch to #{ns[:type]} #{ns[:name]}."
+        else
+          first_namespace ||= ns
+          prev_namespace = ns
+        end
+        
+        type = ns[:suggest_type] || ns[:type]
+        name = ns[:suggest_name] || ns[:name]
+        ns[:suggest_file] = 
+          name.
+          split('::').
+          map { | e | underscore(e) } * '/' + '.rb'
+        
+        if ns[:suggest_file] != f[:file]
+          ns[:unexpected_file] = true
+        end
+      end
+    end
+  end
+
+  def pass_2!
+    do_all_files! :pass_2! do | f |
+      if f[:namespaces].empty?
+        suggest f, "This file is not a candidate for autoloading: no modules or classes."
+      end
+      f[:namespaces].each do | ns |
+        type = ns[:suggest_type] || ns[:type]
+        name = ns[:suggest_name] || ns[:name]
+        
+        if ns[:unexpected_file]
+          if rf = all_required[ns[:suggest_file]]
+            if rf[:namespaces].find { | x | x[:name] == name }
+              ok ns, "The file #{rf[:abs_path]} appears to define #{type} #{name}."
+            else
+              suggest rf, "Verify the file #{rf[:abs_path]} defines #{type} #{name}."
+            end
+          else
+            if ns[:parents].any?{|p| ! p[:unexpected_file]}
+              suggest ns, "Create file for #{type} #{name} named #{f[:dir]}/./#{ns[:suggest_file].inspect}."
+            end
+          end
+        end
+      end
+    end
+  end
+  
+  def output!
+    do_all_files! :output!, :prefix => ("=" * 70) do | f |
+      puts "  #{f[:abs_path]}"
+      puts "  #{(f[:notes] || EMPTY_Array) * "\n  "}"
+      f[:namespaces].each do | ns |
+        puts "  #{ns[:type]} #{ns[:name]} (line #{ns[:lines]}):\n    #{(ns[:notes] || EMPTY_Array) * "\n    "}"
+      end
+    end
+  end
+
+
+  def do_all_files! pass, opts = EMPTY_Hash
     all_files.each do | f |
-      puts '================================================================'
-      puts "#{f.inspect}"
+      if x = opts[:prefix]; puts x; end
+      puts "#{pass} #{f[:rel_path]}"
       # pp sexp
       begin
-        parser = RubyParser.new
-        parser.file = f[:file]
-        
-        sexp = parser.parse(File.read(f[:full_path]))
-
-        nss = AstScanner.new
-        nss.core_modules = @@core_modules
-
-        nss.s_file! sexp
-
-        f[:namespaces] = nss.namespaces
-        # pp nss
-        first_namespace = prev_namespace = nil
-        nss.namespaces.each do | ns |
-          if core_modules_by_name[ns[:name]]
-            mp = ns[:name_path].dup
-            last = mp.pop
-            last = :"Mixin#{last}"
-            mp.push last
-            if mp.size == 1 
-              if other_ns = prev_namespace || first_namespace
-                mp.unshift other_ns[:name_path]
-                mp.flatten!
-              else
-                mp.unshift :SOMETHING
-              end
-            end
-            ns[:suggest_type] = :module
-            ns[:suggest_name] = mp * "::"
-            ns[:suggest_mixin] = ns[:suggest_name]
-            suggest ns, "create a mixin named #{ns[:suggest_name]} for patch to #{ns[:type]} #{ns[:name]}"
-          else
-            first_namespace ||= ns
-            prev_namespace = ns
-          end
-          
-          type = ns[:suggest_type] || ns[:type]
-          name = ns[:suggest_name] || ns[:name]
-          ns[:suggest_file] = 
-            name.
-            split('::').
-            map { | e | underscore(e) } * '/' + '.rb'
-          
-          suggest ns, "create file for #{type} #{name} named #{f[:dir]}/./#{ns[:suggest_file].inspect}"
-        end
+        yield f
       rescue Exception => exc
-        exc = { :inspect => exc.inspect, :backtrace => exc.backtrace }
-        f[:exception] = exc
-        @exceptions << exc
-        $stderr.puts "ERROR #{exc[:inspect]}\n  #{exc[:backtrace] * "\n  "}"
-        debugger if $DEBUG
+        exc = { :pass => pass, :inspect => exc.inspect, :backtrace => exc.backtrace }
+        (f[:exceptions] ||= [ ]) << exc
+        @exceptions << [ pass, exc ]
+        puts "ERROR #{exc[:inspect]}\n  #{exc[:backtrace] * "\n  "}"
+        debugger if @debug > 0
+      end
+
+      if @pause > 0
+        $stderr.write "\n  press ENTER: "
+        $stdin.readline
       end
     end
     self
   end
 
   def suggest ns, msg
-    (ns[:suggestions] ||= [ ]) << msg
-    puts "  suggest: #{msg}"
+    note :suggest, ns, msg
+  end
+
+  def ok ns, msg
+    note :ok, ns, msg
+  end
+
+  def note kind, ns, msg, once = true
+    msg = "#{kind}: #{msg}"
+    notes = (ns[:notes] ||= [ ])
+    return if once && notes.include?(msg)  
+    notes << msg
+    puts "  #{msg}"
     ns
   end
 
-      # stolen from activesupport 3.0.1
-      def underscore(camel_cased_word)
-      word = camel_cased_word.to_s.dup
-      word.gsub!(/::/, '/')
-      word.gsub!(/([A-Z]+)([A-Z][a-z])/,'\1_\2')
-      word.gsub!(/([a-z\d])([A-Z])/,'\1_\2')
-      word.tr!("-", "_")
-      word.downcase!
-      word
-    end
-
+  # stolen from activesupport 3.0.1
+  def underscore(camel_cased_word)
+    word = camel_cased_word.to_s.dup
+    word.gsub!(/::/, '/')
+    word.gsub!(/([A-Z]+)([A-Z][a-z])/,'\1_\2')
+    word.gsub!(/([a-z\d])([A-Z])/,'\1_\2')
+    word.tr!("-", "_")
+    word.downcase!
+    word
+  end
+  
   def report!
-    puts all_files.to_yaml
+    file = "#{File.basename(__FILE__)}.report.yml"
+    puts "writing #{file}"
+    File.open(file, "w+") do | o |
+      o.puts all_files.to_yaml
+    end
     self
   end
 
   def done!
     exit(@exceptions.empty? ? 0 : 1)
+  end
+
+  class FilePattern
+    attr_reader :str
+
+    def initialize str
+      @str = str
+    end
+
+    def === x
+      rx === x.to_s
+    end
+
+    def rx
+      @rx ||=
+        begin
+          x = "\\A"
+          x <<
+            @str.
+            gsub(/\*\*/, "\001").
+            gsub(/\*/, "\002").
+            gsub(/\001/, ".*").
+            gsub(/\002/, "[^/]*")
+          x << "\\Z"
+          Regexp.new(x)
+        end
+    end
   end
 
   class AstScanner
@@ -173,6 +358,7 @@ class ModuleNameChecker
     attr_reader :namespaces
 
     def initialize opts = nil
+      @debug = 0
       @namespaces = [ ]
       @namespace = nil
       @namespace_path = [ ]
@@ -182,7 +368,8 @@ class ModuleNameChecker
       end
     end
     
-    def s_file! e
+    def s_unit! e
+      return unless e
       case e.sexp_type
       when :block, :scope
         s_body! e.sexp_body
@@ -197,12 +384,19 @@ class ModuleNameChecker
         case e.sexp_type
         when :scope, :block
           s_body! e.sexp_body
+        when :if, :unless
+          s_condition! e
         else
           s_class_or_module! e
         end
       end
     end
     
+    def s_condition! e
+      # skip over test to truth and consequence.
+      s_body! e.sexp_body.sexp_body
+    end
+
     def s_class_or_module! e
       case e.sexp_type
       when :class
@@ -226,7 +420,7 @@ class ModuleNameChecker
     end
     
     def s_namespace! type, e
-      debugger
+      debugger if @debug > 0
       @namespace_stack.push [ @namespace, @namespace_path ]
 
       @namespace_path, top_level = s_name(e[1])
@@ -305,14 +499,11 @@ end # module
 require 'pp'
 require 'rubygems'
 gem 'ruby_parser'; require 'ruby_parser'
-if true || $DEBUG
-  gem 'ruby-debug'; require 'ruby-debug'
-end
-# gem 'activesupport'; require 'active_support/inflector'
 
 ######################################################################
 
-Enf::ModuleNameChecker.new(:lib_paths => [ '.' ]).
+Enf::ModuleNameChecker.new().
+  parse_args!.
   locate_files!.
   check_files!.
   report!.
