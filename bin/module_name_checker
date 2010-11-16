@@ -1,0 +1,320 @@
+#!/usr/bin/env ruby
+# -*- ruby -*-
+
+# $DEBUG = 1
+
+######################################################################
+
+module Enf
+
+class ModuleNameChecker
+  EMPTY_String = ''.freeze
+  EMPTY_Hash = { }.freeze
+  EMPTY_Array = [ ].freeze
+
+  @@core_modules = [ ]
+  @@core_modules_by_name = { }
+  ObjectSpace.each_object(::Module) do | obj |
+    if (name = obj.name) && ! name.empty? && name !~ /^Enf(:|$)/
+      @@core_modules_by_name[name] = obj
+    end
+  end
+  @@core_modules = @@core_modules_by_name.values.sort_by{|x| x.name}
+
+  @@lib_paths = $:
+  @@std_paths = eval(`RUBY_LIB= ruby -e 'puts $:.inspect'`)
+
+  attr_accessor :lib_paths, :std_paths, :paths
+  attr_accessor :core_modules
+  attr_reader :all_files, :all_required
+
+  def initialize opts = nil
+    @all_files = [ ]
+    @all_required = { }
+    @exceptions = [ ]
+    (opts || EMPTY_Hash).each do | k, v |
+      send(:"#{k}=", v)
+    end
+  end
+
+  def lib_paths
+    @lib_paths || @@lib_paths
+  end
+
+  def std_paths
+    @std_paths || @@std_paths
+  end
+
+  def core_modules
+    @core_modules || @@core_modules
+  end
+
+  def core_modules_by_name
+    @core_modules_by_name || @@core_modules_by_name
+  end
+
+  def locate_files!
+    @paths = lib_paths - (std_paths - [ '.' ])
+    puts "lib_paths = #{lib_paths.inspect}"
+    puts "std_paths = #{std_paths.inspect}"
+    puts "paths = #{@paths.inspect}"
+    puts "core_modules = #{@@core_modules.inspect}"
+
+    @paths.each do | dir |
+      files = Dir["#{dir}/**/*.rb"].sort
+      puts "dir = #{dir.inspect}"
+      # puts "files = #{PP.pp(files, '')}"
+      files.each do | file |
+        # puts "  file = #{file.inspect}"    
+        file.sub!(%r{\A#{dir}/}, '')
+        # puts "  file = #{file.inspect}"
+        next if all_required[file]
+        f_d = { :file => file, :dir => dir, :full_path => File.expand_path(file, dir) }
+        all_required[file] = f_d
+        all_files << f_d
+      end
+    end
+    self
+  end
+  
+  def check_files!
+    all_files.each do | f |
+      puts '================================================================'
+      puts "#{f.inspect}"
+      # pp sexp
+      begin
+        parser = RubyParser.new
+        parser.file = f[:file]
+        
+        sexp = parser.parse(File.read(f[:full_path]))
+
+        nss = AstScanner.new
+        nss.core_modules = @@core_modules
+
+        nss.s_file! sexp
+
+        f[:namespaces] = nss.namespaces
+        # pp nss
+        first_namespace = prev_namespace = nil
+        nss.namespaces.each do | ns |
+          if core_modules_by_name[ns[:name]]
+            mp = ns[:name_path].dup
+            last = mp.pop
+            last = :"Mixin#{last}"
+            mp.push last
+            if mp.size == 1 
+              if other_ns = prev_namespace || first_namespace
+                mp.unshift other_ns[:name_path]
+                mp.flatten!
+              else
+                mp.unshift :SOMETHING
+              end
+            end
+            ns[:suggest_type] = :module
+            ns[:suggest_name] = mp * "::"
+            ns[:suggest_mixin] = ns[:suggest_name]
+            suggest ns, "create a mixin named #{ns[:suggest_name]} for patch to #{ns[:type]} #{ns[:name]}"
+          else
+            first_namespace ||= ns
+            prev_namespace = ns
+          end
+          
+          type = ns[:suggest_type] || ns[:type]
+          name = ns[:suggest_name] || ns[:name]
+          ns[:suggest_file] = 
+            name.
+            split('::').
+            map { | e | underscore(e) } * '/' + '.rb'
+          
+          suggest ns, "create file for #{type} #{name} named #{f[:dir]}/./#{ns[:suggest_file].inspect}"
+        end
+      rescue Exception => exc
+        exc = { :inspect => exc.inspect, :backtrace => exc.backtrace }
+        f[:exception] = exc
+        @exceptions << exc
+        $stderr.puts "ERROR #{exc[:inspect]}\n  #{exc[:backtrace] * "\n  "}"
+        debugger if $DEBUG
+      end
+    end
+    self
+  end
+
+  def suggest ns, msg
+    (ns[:suggestions] ||= [ ]) << msg
+    puts "  suggest: #{msg}"
+    ns
+  end
+
+      # stolen from activesupport 3.0.1
+      def underscore(camel_cased_word)
+      word = camel_cased_word.to_s.dup
+      word.gsub!(/::/, '/')
+      word.gsub!(/([A-Z]+)([A-Z][a-z])/,'\1_\2')
+      word.gsub!(/([a-z\d])([A-Z])/,'\1_\2')
+      word.tr!("-", "_")
+      word.downcase!
+      word
+    end
+
+  def report!
+    puts all_files.to_yaml
+    self
+  end
+
+  def done!
+    exit(@exceptions.empty? ? 0 : 1)
+  end
+
+  class AstScanner
+    module MyModule
+    end
+    
+    attr_accessor :core_modules
+    attr_reader :namespaces
+
+    def initialize opts = nil
+      @namespaces = [ ]
+      @namespace = nil
+      @namespace_path = [ ]
+      @namespace_stack = [ ]
+      (opts || EMPTY_Hash).each do | k, v |
+        send(:"#{k}=", v)
+      end
+    end
+    
+    def s_file! e
+      case e.sexp_type
+      when :block, :scope
+        s_body! e.sexp_body
+      when :class, :module
+        s_class_or_module! e
+      end
+    end
+
+    def s_body! es
+      es.each do | e |
+        next unless Sexp === e
+        case e.sexp_type
+        when :scope, :block
+          s_body! e.sexp_body
+        else
+          s_class_or_module! e
+        end
+      end
+    end
+    
+    def s_class_or_module! e
+      case e.sexp_type
+      when :class
+        s_class! e
+      when :module
+        s_module! e
+      end
+    end
+    
+    def s_class! e
+      s_namespace!(:class, e) do | e |
+        # skip superclass expr.
+        s_namespace_body! e.sexp_body.sexp_body
+      end
+    end
+    
+    def s_module! e
+      s_namespace!(:module, e) do | e |
+        s_namespace_body! e.sexp_body
+      end
+    end
+    
+    def s_namespace! type, e
+      debugger
+      @namespace_stack.push [ @namespace, @namespace_path ]
+
+      @namespace_path, top_level = s_name(e[1])
+
+      @namespace = {
+        :lines => [ e.line, nil ],
+        :type => type, 
+        :name_path => @namespace_path,
+        :name => @namespace_path * "::", 
+        :top_level => top_level, 
+        :parent => @namespace,
+      }
+
+      @namespaces << @namespace
+
+      yield e.sexp_body
+
+    ensure
+      @namespace, @namespace_path = @namespace_stack.pop
+    end
+    
+    def s_name e
+=begin
+      unless Symbol === e
+        pp [ :e=, e ]
+        debugger if $DEBUG
+      end
+=end
+
+      path = @namespace_path.dup
+      @top_level = false
+
+      s_name_1 e, path
+
+      [ path, @top_level ]
+    end
+
+    def s_name_1 e, path
+      case e
+      when Sexp
+        case e.sexp_type
+        when :colon3
+          @top_level = true
+          path.clear
+          path.push e[1]
+          name = nil
+        when :colon2
+          s_name_1 e[1], path
+          s_name_1 e[2], path
+        when :const
+          path << e[1]
+        else
+          raise "cannot handle #{e.inspect}"
+        end
+      when Symbol
+        path << e
+      else
+        raise "cannot handle #{e.inspect}"
+      end
+      path
+    end
+
+    def s_namespace_body! es
+      if false && [ "Enf", "NamespaceScanner" ].include?(@namespace[1])
+        pp [ @namespace, es ]
+        debugger if $DEBUG 
+      end
+      s_body! es
+    end
+  end
+end
+end # module
+
+######################################################################
+
+require 'pp'
+require 'rubygems'
+gem 'ruby_parser'; require 'ruby_parser'
+if true || $DEBUG
+  gem 'ruby-debug'; require 'ruby-debug'
+end
+# gem 'activesupport'; require 'active_support/inflector'
+
+######################################################################
+
+Enf::ModuleNameChecker.new(:lib_paths => [ '.' ]).
+  locate_files!.
+  check_files!.
+  report!.
+  done!
+
