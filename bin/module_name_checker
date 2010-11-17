@@ -28,12 +28,12 @@ class ModuleNameChecker
 
   attr_accessor :lib_paths, :std_paths, :skip_paths, :other_paths, :paths
   attr_accessor :core_modules
-  attr_reader :all_files, :all_required
+  attr_reader :all_files, :files_by_name
 
   def initialize opts = nil
     @args = ARGV
     @all_files = [ ]
-    @all_required = { }
+    @files_by_name = { }
     @other_paths = [ ]
     @exceptions = [ ]
     @skip_paths = [ ]
@@ -130,14 +130,14 @@ class ModuleNameChecker
         # puts "  file = #{file.inspect}"    
         file.sub!(dir_rx, '')
         # puts "  file = #{file.inspect}"
-        next if all_required[file]
+        next if files_by_name[file]
         f_d = { 
           :file => file, 
           :dir => dir, 
           :rel_path => rel_path,
           :abs_path => File.expand_path(file, dir),
         }
-        all_required[file] = f_d
+        files_by_name[file] = f_d
         all_files << f_d
       end
     end
@@ -156,6 +156,7 @@ class ModuleNameChecker
   def pass_0!
     do_all_files! :pass_0! do | f |
       f[:namespaces] = [ ]
+      f[:requires] = [ ]
 
       parser = RubyParser.new
       parser.file = f[:file]
@@ -166,7 +167,8 @@ class ModuleNameChecker
       nss.core_modules = @@core_modules
       
       nss.s_unit! sexp
-      
+
+      f[:requires] = nss.requires
       namespaces = f[:namespaces] = nss.namespaces
       
       namespaces.each do | ns |
@@ -183,6 +185,16 @@ class ModuleNameChecker
 
   def pass_1!
     do_all_files! :pass_1! do | f |
+      f[:require_files] = [ ]
+      f[:requires].each do | r |
+        if r =~ /\.rb\Z/
+          suggest f, "Remove .rb suffix from require #{r.inspect}."
+        end
+        if fo = files_by_name[r] || files_by_name["#{r}.rb"]
+          f[:require_files] << fo
+        end
+      end
+
       # pp nss
       first_namespace = prev_namespace = nil
       f[:namespaces].each do | ns |
@@ -232,7 +244,7 @@ class ModuleNameChecker
         name = ns[:suggest_name] || ns[:name]
         
         if ns[:unexpected_file]
-          if rf = all_required[ns[:suggest_file]]
+          if rf = files_by_name[ns[:suggest_file]]
             if rf[:namespaces].find { | x | x[:name] == name }
               ok ns, "The file #{rf[:abs_path]} appears to define #{type} #{name}."
             else
@@ -251,6 +263,8 @@ class ModuleNameChecker
   def output!
     do_all_files! :output!, :prefix => ("=" * 70) do | f |
       puts "  #{f[:abs_path]}"
+      puts "  #{(f[:exceptions] || EMPTY_Array).map{|e| "exception #{e.inspect}"} * "\n  "}"
+      puts "  #{f[:requires].map{|r| "require #{r.inspect}"} * "\n  "}"
       puts "  #{(f[:notes] || EMPTY_Array) * "\n  "}"
       f[:namespaces].each do | ns |
         puts "  #{ns[:type]} #{ns[:name]} (line #{ns[:lines]}):\n    #{(ns[:notes] || EMPTY_Array) * "\n    "}"
@@ -355,7 +369,7 @@ class ModuleNameChecker
     end
     
     attr_accessor :core_modules
-    attr_reader :namespaces
+    attr_reader :namespaces, :requires
 
     def initialize opts = nil
       @debug = 0
@@ -363,6 +377,7 @@ class ModuleNameChecker
       @namespace = nil
       @namespace_path = [ ]
       @namespace_stack = [ ]
+      @requires = [ ]
       (opts || EMPTY_Hash).each do | k, v |
         send(:"#{k}=", v)
       end
@@ -372,10 +387,40 @@ class ModuleNameChecker
       return unless e
       case e.sexp_type
       when :block, :scope
-        s_body! e.sexp_body
+        s_unit_body! e.sexp_body
       when :class, :module
         s_class_or_module! e
       end
+    end
+
+    def s_unit_body! es
+      es.each do | e |
+        next unless Sexp === e
+        case e.sexp_type
+        when :scope, :block
+          s_unit_body! e.sexp_body
+        when :if, :unless
+          s_condition! e
+        when :class, :module
+          s_class_or_module! e
+        else
+          s_require! e
+        end
+      end
+    end
+
+    def s_require! e
+      if e[0] == :call && e[1] == nil && e[2] == :require
+        e1 = e[3]
+        if e1[0] == :arglist
+          e2 = e1[1]
+          if e2[0] == :str
+            @requires << e2[1]
+            return true
+          end
+        end
+      end
+      nil
     end
 
     def s_body! es
@@ -386,8 +431,10 @@ class ModuleNameChecker
           s_body! e.sexp_body
         when :if, :unless
           s_condition! e
-        else
+        when :class, :module
           s_class_or_module! e
+        else
+          # pp [:other, e ]
         end
       end
     end
