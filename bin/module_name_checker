@@ -37,6 +37,7 @@ class ModuleNameChecker
     @other_paths = [ ]
     @exceptions = [ ]
     @skip_paths = [ ]
+    @debugger ||= 0
     @debug ||= 0
     @pause ||= 0
     (opts || EMPTY_Hash).each do | k, v |
@@ -69,6 +70,8 @@ class ModuleNameChecker
       case arg
       when /^--?d/
         @debug += 1
+      when /^--?D/
+        @debugger += 1
       when /^--?p/
         @pause += 1
       when /^--?(sp|skip-path)/
@@ -93,7 +96,7 @@ class ModuleNameChecker
       end
     end
 
-    if @debug + @pause > 0
+    if @debugger + @debug + @pause > 0
       gem 'ruby-debug'
       require 'ruby-debug'
     end
@@ -415,6 +418,7 @@ class ModuleNameChecker
         if e1[0] == :arglist
           e2 = e1[1]
           if e2[0] == :str
+            debugger
             @requires << e2[1]
             return true
           end
